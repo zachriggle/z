@@ -3,25 +3,28 @@
 # maintains a jump-list of the directories you actually use
 #
 # INSTALL:
+#   * put something like this in your .bashrc/.zshrc:
+#     . /path/to/z.sh
+#   * cd around for a while to build up the db
+#   * PROFIT!!
 #   * optionally:
 #     set $_Z_CMD in .bashrc/.zshrc to change the command (default z).
 #     set $_Z_DATA in .bashrc/.zshrc to change the datafile (default ~/.z).
-#   * put something like this in your .bashrc:
-#     . /path/to/z.sh
-#   * put something like this in your .zshrc:
-#     . /path/to/z.sh
-#     function precmd () {
-#       _z --add "$(pwd -P)"
-#     }
-#   * cd around for a while to build up the db
-#   * PROFIT!!
+#     set $_Z_NO_RESOLVE_SYMLINKS to prevent symlink resolution.
+#     set $_Z_NO_PROMPT_COMMAND if you're handling PROMPT_COMMAND yourself.
+#     set $_Z_EXCLUDE_DIRS to an array of directories to exclude.
 #
 # USE:
 #   * z foo     # cd to most frecent dir matching foo
 #   * z foo bar # cd to most frecent dir matching foo and bar
 #   * z -r foo  # cd to highest ranked dir matching foo
 #   * z -t foo  # cd to most recently accessed dir matching foo
-#   * z -l foo  # list all dirs matching foo (by frecency)
+#   * z -l foo  # list matches instead of cd
+#   * z -c foo  # restrict matches to subdirs of $PWD
+
+[ -d "${_Z_DATA:-$HOME/.z}" ] && {
+    echo "ERROR: z.sh's datafile (${_Z_DATA:-$HOME/.z}) is a directory."
+}
 
 _z() {
 
@@ -37,10 +40,18 @@ _z() {
   # $HOME isn't worth matching
   [ "$*" = "$HOME" ] && return
 
+  # don't track excluded dirs
+  local exclude
+  for exclude in "${_Z_EXCLUDE_DIRS[@]}"; do
+   [ "$*" = "$exclude" ] && return
+  done
+
   # maintain the file
   local tempfile
-  tempfile="$(mktemp $datafile.XXXXXX)" || return
-  awk -v path="$*" -v now="$(date +%s)" -F"|" '
+  tempfile="$(mktemp "$datafile.XXXXXX")" || return
+  while read line; do
+   [ -d "${line%%\|*}" ] && echo $line
+  done < "$datafile" | awk -v path="$*" -v now="$(date +%s)" -F"|" '
    BEGIN {
     rank[path] = 1
     time[path] = now
@@ -56,26 +67,27 @@ _z() {
     count += $2
    }
    END {
-    if( count > 1000 ) {
-     for( i in rank ) print i "|" 0.9*rank[i] "|" time[i] # aging
+    if( count > 6000 ) {
+     for( i in rank ) print i "|" 0.99*rank[i] "|" time[i] # aging
     } else for( i in rank ) print i "|" rank[i] "|" time[i]
    }
-  ' "$datafile" 2>/dev/null >| "$tempfile"
+  ' 2>/dev/null >| "$tempfile"
   if [ $? -ne 0 -a -f "$datafile" ]; then
    env rm -f "$tempfile"
   else
-   env mv -f "$tempfile" "$datafile"
+   env mv -f "$tempfile" "$datafile" || env rm -f "$tmpfile"
   fi
 
  # tab completion
  elif [ "$1" = "--complete" ]; then
-  awk -v q="$2" -F"|" '
+  while read line; do
+   [ -d "${line%%\|*}" ] && echo $line
+  done < "$datafile" | awk -v q="$2" -F"|" '
    BEGIN {
     if( q == tolower(q) ) nocase = 1
     split(substr(q,3),fnd," ")
    }
    {
-    if( system("test -d \"" $1 "\"") ) next
     if( nocase ) {
      for( i in fnd ) tolower($1) !~ tolower(fnd[i]) && $1 = ""
     } else {
@@ -83,19 +95,23 @@ _z() {
     }
     if( $1 ) print $1
    }
-  ' "$datafile" 2>/dev/null
+  ' 2>/dev/null
 
  else
   # list/go
   while [ "$1" ]; do case "$1" in
-   -h) echo "z [-h][-l][-r][-t] args" >&2; return;;
-   -l) local list=1;;
-   -r) local typ="rank";;
-   -t) local typ="recent";;
    --) while [ "$1" ]; do shift; local fnd="$fnd $1";done;;
+   -*) local opt=${1:1}; while [ "$opt" ]; do case ${opt:0:1} in
+        c) local fnd="^$PWD $fnd";;
+        h) echo "${_Z_CMD:-z} [-chlrtx] args" >&2; return;;
+        x) sed -i "\:^${PWD}|.*:d" "$datafile";;
+        l) local list=1;;
+        r) local typ="rank";;
+        t) local typ="recent";;
+       esac; opt=${opt:1}; done;;
     *) local fnd="$fnd $1";;
   esac; local last=$1; shift; done
-  [ "$fnd" ] || local list=1
+  [ "$fnd" -a "$fnd" != "^$PWD " ] || local list=1
 
   # if we hit enter on a completion just go there
   case "$last" in
@@ -107,7 +123,9 @@ _z() {
   [ -f "$datafile" ] || return
 
   local cd
-  cd="$(awk -v t="$(date +%s)" -v list="$list" -v typ="$typ" -v q="$fnd" -F"|" '
+  cd="$(while read line; do
+   [ -d "${line%%\|*}" ] && echo $line
+  done < "$datafile" | awk -v t="$(date +%s)" -v list="$list" -v typ="$typ" -v q="$fnd" -F"|" '
    function frecent(rank, time) {
     dx = t-time
     if( dx < 3600 ) return rank*4
@@ -117,9 +135,7 @@ _z() {
    }
    function output(files, toopen, override) {
     if( list ) {
-     if( typ == "recent" ) {
-      cmd = "sort -nr >&2"
-     } else cmd = "sort -n >&2"
+     cmd = "sort -n >&2"
      for( i in files ) if( files[i] ) printf "%-10s %s\n", files[i], i | cmd
      if( override ) printf "%-10s %s\n", "common:", override > "/dev/stderr"
     } else {
@@ -133,27 +149,29 @@ _z() {
      if( matches[i] && (!short || length(i) < length(short)) ) short = i
     }
     if( short == "/" ) return
-    # shortest match must be common to each match
-    for( i in matches ) if( matches[i] && i !~ short ) return
+    # shortest match must be common to each match. escape special characters in
+    # a copy when testing, so we can return the original.
+    clean_short = short
+    gsub(/[\(\)\[\]\|]/, "\\\\&", clean_short)
+    for( i in matches ) if( matches[i] && i !~ clean_short ) return
     return short
    }
-   BEGIN { split(q, a, " ") }
+   BEGIN { split(q, a, " "); oldf = noldf = -9999999999 }
    {
-    if( system("test -d \"" $1 "\"") ) next
     if( typ == "rank" ) {
      f = $2
     } else if( typ == "recent" ) {
-     f = t-$3
+     f = $3-t
     } else f = frecent($2, $3)
     wcase[$1] = nocase[$1] = f
     for( i in a ) {
      if( $1 !~ a[i] ) delete wcase[$1]
      if( tolower($1) !~ tolower(a[i]) ) delete nocase[$1]
     }
-    if( wcase[$1] > oldf ) {
+    if( wcase[$1] && wcase[$1] > oldf ) {
      cx = $1
      oldf = wcase[$1]
-    } else if( nocase[$1] > noldf ) {
+    } else if( nocase[$1] && nocase[$1] > noldf ) {
      ncx = $1
      noldf = nocase[$1]
     }
@@ -163,7 +181,7 @@ _z() {
      output(wcase, cx, common(wcase))
     } else if( ncx ) output(nocase, ncx, common(nocase))
    }
-  ' "$datafile")"
+  ')"
   [ $? -gt 0 ] && return
   [ "$cd" ] && cd "$cd"
  fi
@@ -171,13 +189,22 @@ _z() {
 
 alias ${_Z_CMD:-z}='_z 2>&1'
 
-if complete &> /dev/null; then
- # bash tab completion
- complete -C '_z --complete "$COMP_LINE"' ${_Z_CMD:-z}
- # populate directory list. avoid clobbering other PROMPT_COMMANDs.
- echo $PROMPT_COMMAND | grep -q "_z --add"
- [ $? -gt 0 ] && PROMPT_COMMAND='_z --add "$(pwd -P 2>/dev/null)" 2>/dev/null;'"$PROMPT_COMMAND"
-elif compctl &> /dev/null; then
+[ "$_Z_NO_RESOLVE_SYMLINKS" ] || _Z_RESOLVE_SYMLINKS="-P"
+
+if compctl &> /dev/null; then
+ [ "$_Z_NO_PROMPT_COMMAND" ] || {
+  # zsh populate directory list, avoid clobbering any other precmds
+  if [ "$_Z_NO_RESOLVE_SYMLINKS" ]; then
+    _z_precmd() {
+      _z --add "${PWD:a}"
+    }
+  else
+    _z_precmd() {
+      _z --add "${PWD:A}"
+    }
+  fi
+  precmd_functions+=(_z_precmd)
+ }
  # zsh tab completion
  _z_zsh_tab_completion() {
   local compl
@@ -185,4 +212,13 @@ elif compctl &> /dev/null; then
   reply=(${(f)"$(_z --complete "$compl")"})
  }
  compctl -U -K _z_zsh_tab_completion _z
+elif complete &> /dev/null; then
+ # bash tab completion
+ complete -o filenames -C '_z --complete "$COMP_LINE"' ${_Z_CMD:-z}
+ [ "$_Z_NO_PROMPT_COMMAND" ] || {
+  # bash populate directory list. avoid clobbering other PROMPT_COMMANDs.
+  echo $PROMPT_COMMAND | grep -q "_z --add" || {
+   PROMPT_COMMAND='_z --add "$(pwd '$_Z_RESOLVE_SYMLINKS' 2>/dev/null)" 2>/dev/null;'"$PROMPT_COMMAND"
+  }
+ }
 fi
